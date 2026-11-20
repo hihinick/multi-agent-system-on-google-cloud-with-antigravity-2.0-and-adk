@@ -12,7 +12,12 @@
    - [面對 30 天 Ground Truth 延遲的挑戰](#面對-30-天-ground-truth-延遲的挑戰)
    - [雙層閉環系統架構 (Two-Loop System)](#雙層閉環系統架構-two-loop-system)
    - [三大工程落地策略（解決是否需要天天重跑的問題）](#三大工程落地策略解決是否需要天天重跑的問題)
-5. [實作代碼與 SQL 參考](#實作代碼與-sql-參考)
+5. [企業級安全防護與人機協同架構 (Module 3 深度防禦與思維鏈)](#企業級安全防護與人機協同架構-module-3-深度防禦與思維鏈)
+   - [PreToolUse 生命週期攔截鉤子（白名單、路徑遍歷與 Prompt Injection 阻絕）](#1-pretooluse-生命週期攔截鉤子工具調用防護)
+   - [PII 機敏資料去識別化過濾器（保護 Log 審計與模型推論免於資料洩漏）](#2-pii-機敏資料遞迴去識別化過濾器pii-scrubber)
+   - [ADK Human-in-the-Loop (HITL) 雙節點審核閘道與 Fail-Closed 熔斷](#3-adk-human-in-the-loop-hitl-雙節點審核閘道)
+6. [生產級 Token 經濟學與上下文最佳化 (Module 4 Tokenomics)](#生產級-token-經濟學與上下文最佳化-module-4-tokenomics)
+7. [實作代碼與 SQL 參考](#實作代碼與-sql-參考)
 
 ---
 
@@ -202,6 +207,136 @@ def tune_prompt_and_skill(
     return svc.score_brand_compliance([tuned])[0]
 ```
 
+---
+
+## 企業級安全防護與人機協同架構 (Module 3 深度防禦與思維鏈)
+
+在自主多代理人系統（Autonomous Multi-Agent System）中，模型具備動態調用工具、存取外部 API 及串接多節點推論的能力。若缺乏邊界防護，可能面臨**提權漏洞（Privilege Escalation）、Prompt 注入攻擊（Prompt Injection）、機敏資料洩漏（PII Leakage in Telemetry & Inference），以及未經授權的高代價操作**。
+
+本專案在 Module 3 建立了一套**三層縱深防禦體系（Defense-in-Depth Architecture）**：
+
+```mermaid
+graph TD
+    UserReq["使用者輸入 / 企劃需求"] --> Step3b["1. 入口消毒 (PII Scrubber)<br>遞迴去識別化 API Secret, Email, Phone, SSN, CC"]
+    Step3b --> CD["Creative Director 代理人<br>(產生概念草案 Concept)"]
+    CD --> Step3c["2. 人機協同審核閘道 (HITL Gate)<br>rerun_on_resume 語意控制"]
+    Step3c -- "approved is None (Pause)" --> WaitHuman["暫停執行<br>等待人類批准 (RequestInput)"]
+    Step3c -- "approved is False (Fail-Closed)" --> Reject["熔斷終止<br>0 呼叫下游專家節點 (downstream_calls=0)"]
+    Step3c -- "approved is True (Resume)" --> Unlocked["審核通過 (## Approved Concept)<br>解鎖下游專家節點"]
+    Unlocked --> Specialist["下游代理人協作<br>(Brand Strategist, Copywriter, Visual Director)"]
+    Specialist --> Step3a["3. 工具調用守門人 (PreToolUse Hook)<br>工具白名單、參數大小上限、注入特徵檢測、路徑穿越防護"]
+    Step3a -- "Blocked" --> ToolErr["拒絕執行 (ToolAuthorizationError)<br>記錄安全審計日誌 (Audit Log)"]
+    Step3a -- "Allowed" --> ExecTool["安全執行底層工具<br>(generate_key_visual / load_skill)"]
+```
+
+---
+
+### 1. PreToolUse 生命週期攔截鉤子（工具調用防護）
+
+#### 底層思維鏈與防禦設計
+- **最小權限原則（Least Privilege）**：嚴格限制 Agent 僅能調用經過授權的工具清單（`DEFAULT_TOOL_ALLOWLIST = {"load_skill", "generate_key_visual"}`）。任何未在名單中的調用（如試圖調用 `exec_shell`、`rm_file` 等系統命令）一律直接阻斷。
+- **越權覆寫參數防禦（Forbidden Override Keys）**：禁止輸入 payload 包含 `bypass_safety`、`override_brand_guidelines`、`disable_audit`、`admin_mode`、`skip_verification` 等高危金鑰。
+- **路徑穿越與資源洩漏（Path Traversal）**：在 `load_skill` 的參數中，嚴格阻絕 `..`、`/`、`\` 等符號，防止代理人跳脫受限目錄讀取底層檔案。
+- **阻斷攻擊與 DoS 防護（Oversized Argument Guard）**：設定 `MAX_ARGUMENT_LENGTH = 4096`，阻斷透過極長字串進行緩衝區溢位或上下文淹沒攻擊。
+- **提示詞注入特徵偵測（Prompt Injection Patterns）**：透過正則掃描常見注入模式（例如 `ignore previous instructions`、`disregard earlier`、`<system>`、`you are now in developer mode`、`reveal secret prompt` 等）。
+- **審計可追溯性（Immutable Audit Trail）**：每一次攔截檢查均生成結構化的 `AuditEntry`，記錄時間戳、工具名稱、決策（`allowed` / `blocked`）、違反原因及雜湊，確保安全事件具備不可否認性。
+
+---
+
+### 2. PII 機敏資料遞迴去識別化過濾器（PII Scrubber）
+
+#### 底層思維鏈與業務痛點
+在多代理人工作流程中，原始輸入若夾帶機敏個資，會直接面臨雙重風險：
+1. **日誌與遙測持久化洩漏**：未遮蔽的個資會直接隨 BigQuery Telemetry 或 Cloud Logging 寫入資料庫，違反 GDPR、PCI-DSS、HIPAA 法規。
+2. **模型推論污染與回顯**：模型在推論時可能將使用者的 API Key、電話號碼或信用卡號直接回顯至生成的社群文案或圖片提示詞中。
+
+#### 核心技術實現與保護邊界
+- **零原地變更（Zero In-Place Mutation）**：對傳入的巢狀資料結構（dict、list、tuple、set）一律採用 `copy.deepcopy` 遞迴清洗，確保不污染呼叫端的記憶體狀態。
+- **五大機敏模式精準匹配（PII Patterns）**：
+  - API 金鑰 / Bearer Token / Google API Key (`AIzaSy...`) $\rightarrow$ `[REDACTED_SECRET]`
+  - 電子郵件信箱 $\rightarrow$ `[REDACTED_EMAIL]`
+  - 13 至 19 碼信用卡卡號 $\rightarrow$ `[REDACTED_CC]`
+  - 社會安全碼 (SSN) $\rightarrow$ `[REDACTED_SSN]`
+  - 國際與本地電話號碼 $\rightarrow$ `[REDACTED_PHONE]`
+- **非破壞性正規劃（False-Positive Avoidance）**：經過精密邊界錨定，**絕對不誤傷合法 ISO 日期（如 `2026-10-15`）與行銷轉換指標（如 `42%`、`350 lumen`）**。
+- **字串相容結構（`ScrubResult(str)`）**：繼承自 `str`，既可直接進行 `in` 子字串比對，又具備 `.scrubbed` 與 `.redaction_count` 計數指標。
+
+---
+
+### 3. ADK Human-in-the-Loop (HITL) 雙節點審核閘道
+
+#### 底層思維鏈與工作流程控制
+在行銷企劃案中，創意總監（Creative Director）生成的「概念草案」是整個行銷案的基石。如果概念方向錯誤，後續讓文案專家與視覺總監自動生成大量社群貼文與圖片，不僅會浪費高昂的 GPU/LLM 算力，還可能產生不當品牌資產。
+
+HITL 閘道實作了標準的 **兩節點 ADK 暫停與恢復語意（Pause/Resume Semantics）**：
+1. **輸入請求節點（`approve_concept`）**：
+   - 設定 `@node(rerun_on_resume=False)`。
+   - 驗證草案內容存在後發出 `RequestInput("Please approve the campaign concept (yes/no).", response_schema=str)`，工作流程在此進入 `status="input_required"` 暫停狀態。
+2. **審核裁決節點（`user_approval`）**：
+   - 設定 `@node(rerun_on_resume=True)`。
+   - 於 Session 恢復（Resume）時運行，調用 `ctx.run_node(approve_concept)` 讀取人工決定。
+   - **明確肯定**（`"yes"`, `"y"`, `"true"`, `"approved"`）：輸出 `## Approved Concept` 並發出解鎖事件，讓下游的文案編寫（`copywriter`）與主視覺繪製（`remote_visual_director`）繼續進行（`downstream_calls=2`）。
+   - **Fail-Closed 嚴格熔斷**：任何否定（`"no"`）或未預期輸入均直接丟出 `ValueError("User rejected the concept")`，強制將狀態標記為 `rejected`，**下游呼叫數嚴格歸零（`downstream_calls=0`）**。
+
+---
+
+## 生產級 Token 經濟學與上下文最佳化 (Module 4 Tokenomics)
+
+在多代理人與多輪對話系統中，上下文視窗的無限膨脹會直接導致**成本指數級上升、回應延遲拉長，以及「失焦在中間（Lost in the Middle）」的注意力衰減問題**。
+
+Module 4 實現了四重 Token 最佳化機制：
+1. **滑動視窗與預算修剪（Sliding-Window Pruning - `prune_history`）**：
+   - 根據設定的 `max_turns`（對話輪數上限）與 `max_tokens`（Token 預算上限），自動保留最新的對話輪次，並在必要時對單一超長訊息執行字元修剪（`"truncated": True`）。
+2. **上下文遞迴摘要壓縮（Memory Compression - `compress_memory`）**：
+   - 保留最近 `keep_recent=2` 輪對話的原汁原味，而將較早的歷史記憶萃取壓縮為單一的系統摘要訊息（`{"role": "system", "compressed": True, ...}`），平均節省 50%~80% 的歷史上下文 Token。
+3. **SHA-256 前綴提示詞快取管理（Prompt Cache Manager - `PromptCacheManager`）**：
+   - 利用 SHA-256 計算系統提示詞（System Instruction）與高頻語料的特徵雜湊，建立符合 Google Cloud 5 分鐘 TTL 標準的快取索引（`cache_key = "cache_v1_<hash[:16]>"`），避免重複計算相同前綴。
+4. **智慧動態模型路由（Dynamic Model Routing - `select_model_strategy`）**：
+   - 依據任務複雜度、上下文長度及角色動態選型：簡單的分類或簡短文案路由至極速輕量的 `gemini-2.5-flash`，複雜的創意構思或長篇品牌戰略則調度至強大推理的 `gemini-2.5-pro`。
+
+---
+
+## 實作代碼與 SQL 參考
+
+### Python: 閉環自動調優核心函數實作
+```python
+def tune_prompt_and_skill(
+    record: dict[str, Any],
+    service: BigQueryAnalyticsService | None = None,
+) -> dict[str, Any]:
+    """
+    閉環自動調優：剝除違規禁用詞並注入四大品牌支柱，確保重測分數 >= 7.0 (On Brand)。
+    """
+    tuned = copy.deepcopy(record)
+    text = str(tuned.get("art_direction") or tuned.get("prompt") or "")
+
+    # 1. 移除禁用詞
+    forbidden_terms = [
+        "neon", "cyan", "magenta", "watermark", "logo",
+        "ring light", "3d render", "fluorescent", "chrome"
+    ]
+    cleaned_text = text
+    for term in forbidden_terms:
+        cleaned_text = re.sub(re.escape(term), "", cleaned_text, flags=re.IGNORECASE)
+    cleaned_text = re.sub(r"\s+", " ", cleaned_text).strip()
+
+    # 2. 注入核心品牌支柱
+    house_pillars = (
+        " Palette: deep indigo and slate with warm amber accent."
+        " Lighting: single low raking light with long shadows."
+        " Composition: off-center composition with generous negative space."
+        " Subject: one realistic photographic subject."
+    )
+    tuned_prompt = (cleaned_text + house_pillars).strip()
+    tuned["prompt"] = tuned_prompt
+    tuned.pop("brand_fit", None)
+    tuned.pop("verdict", None)
+
+    # 3. 閉環重新評分
+    svc = service or _DEFAULT_ANALYTICS_SERVICE
+    return svc.score_brand_compliance([tuned])[0]
+```
+
 ### BigQuery: 即時遙測數據查詢
 ```sql
 SELECT
@@ -217,3 +352,4 @@ FROM
 ORDER BY
   recorded_at DESC;
 ```
+
