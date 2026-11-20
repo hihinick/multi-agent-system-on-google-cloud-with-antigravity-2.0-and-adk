@@ -76,6 +76,13 @@ from pitch_generator.agent import (
     strip_markdown_fences,
     types,
     visual_director,
+    estimate_tokens,
+    CompressedHistoryList,
+    compress_memory,
+    prune_history,
+    PromptCacheManager,
+    select_model_strategy,
+    TokenomicsManager,
 )
 from pitch_generator.config import ConfigurationError, PitchConfig, get_config, normalize_bucket_name
 
@@ -90,6 +97,13 @@ __all__ = [
     "MODEL",
     "IMAGE_MODEL",
     "SPECIALIST_AGENTS",
+    "estimate_tokens",
+    "CompressedHistoryList",
+    "compress_memory",
+    "prune_history",
+    "PromptCacheManager",
+    "select_model_strategy",
+    "TokenomicsManager",
     "Agent",
     "App",
     "ArtDirectionPayload",
